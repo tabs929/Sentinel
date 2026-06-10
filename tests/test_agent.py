@@ -5,7 +5,7 @@ from urllib.error import URLError
 from sentinel.agent import HttpClient, MultiTurnAgent, RetryPolicy
 
 
-class FakeSpan:
+class MockSpan:
     def __init__(self, name, sink):
         self.name = name
         self.sink = sink
@@ -25,15 +25,15 @@ class FakeSpan:
         self.attributes["exception"] = str(exc)
 
 
-class FakeTracer:
+class MockTracer:
     def __init__(self):
         self.spans = []
 
     def start_as_current_span(self, name):
-        return FakeSpan(name, self.spans)
+        return MockSpan(name, self.spans)
 
 
-class FakeGitHubClient:
+class MockGitHubClient:
     def __init__(self, should_fail=False):
         self.should_fail = should_fail
 
@@ -43,7 +43,7 @@ class FakeGitHubClient:
         return {"repo": repo, "number": number, "title": "Issue title"}
 
 
-class FakeLinearClient:
+class MockLinearClient:
     def __init__(self, should_fail=False):
         self.should_fail = should_fail
 
@@ -53,25 +53,29 @@ class FakeLinearClient:
         return {"results": [{"id": "LIN-1", "title": query}]}
 
 
-class FakeSlackClient:
-    def __init__(self):
+class MockSlackClient:
+    def __init__(self, should_fail=False):
+        self.should_fail = should_fail
         self.messages = []
 
     def post_message(self, channel, text):
+        if self.should_fail:
+            raise RuntimeError("slack unavailable")
         self.messages.append((channel, text))
         return {"ok": True, "channel": channel}
 
 
 class AgentTests(unittest.TestCase):
-    def test_http_client_retries_transient_errors(self):
+    def test_http_client_retries_url_errors(self):
         attempts = {"count": 0}
+        policy = RetryPolicy(attempts=3, backoff_seconds=0)
 
         def fake_urlopen(request, timeout):
             attempts["count"] += 1
-            if attempts["count"] < 3:
+            if attempts["count"] < policy.attempts:
                 raise URLError("temporary")
 
-            class _Response:
+            class MockResponse:
                 def __enter__(self):
                     return self
 
@@ -81,22 +85,36 @@ class AgentTests(unittest.TestCase):
                 def read(self):
                     return b'{"ok": true}'
 
-            return _Response()
+            return MockResponse()
 
-        client = HttpClient(RetryPolicy(attempts=3, backoff_seconds=0))
+        client = HttpClient(policy)
         with patch("sentinel.agent.urlopen", side_effect=fake_urlopen):
             result = client.request("GET", "https://example.com", headers={})
 
         self.assertEqual(result["ok"], True)
         self.assertEqual(attempts["count"], 3)
 
+    def test_http_client_raises_after_exhausted_retries(self):
+        attempts = {"count": 0}
+
+        def always_fail(request, timeout):
+            attempts["count"] += 1
+            raise URLError("still failing")
+
+        client = HttpClient(RetryPolicy(attempts=3, backoff_seconds=0))
+        with patch("sentinel.agent.urlopen", side_effect=always_fail):
+            with self.assertRaises(URLError):
+                client.request("GET", "https://example.com", headers={})
+
+        self.assertEqual(attempts["count"], 3)
+
     def test_agent_gracefully_degrades_and_traces_failures(self):
-        tracer = FakeTracer()
+        tracer = MockTracer()
         agent = MultiTurnAgent(
             llm_call=lambda user_message, history, context: "fallback response",
-            github_client=FakeGitHubClient(should_fail=True),
-            linear_client=FakeLinearClient(),
-            slack_client=FakeSlackClient(),
+            github_client=MockGitHubClient(should_fail=True),
+            linear_client=MockLinearClient(),
+            slack_client=MockSlackClient(),
             tracer=tracer,
         )
 
@@ -115,6 +133,27 @@ class AgentTests(unittest.TestCase):
         self.assertIn("tool.github.get_issue", span_names)
         self.assertIn("tool.failure", span_names)
         self.assertIn("llm.call", span_names)
+
+    def test_agent_gracefully_degrades_on_linear_and_slack_failures(self):
+        tracer = MockTracer()
+        agent = MultiTurnAgent(
+            llm_call=lambda user_message, history, context: "degraded response",
+            github_client=MockGitHubClient(),
+            linear_client=MockLinearClient(should_fail=True),
+            slack_client=MockSlackClient(should_fail=True),
+            tracer=tracer,
+        )
+
+        result = agent.run_turn(
+            "status update",
+            github_repo="tabs929/Sentinel",
+            issue_number=1,
+            slack_channel="#ops",
+        )
+
+        self.assertTrue(result.degraded)
+        self.assertIn("linear.search_issues", result.failures)
+        self.assertIn("slack.post_message", result.failures)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import traceback
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
@@ -14,7 +14,7 @@ try:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
-except ImportError:  # pragma: no cover - exercised implicitly via fallback behavior
+except ImportError:  # pragma: no cover - tested implicitly through fallback behavior
     trace = None
     OTLPSpanExporter = None
     Resource = None
@@ -55,27 +55,21 @@ class HttpClient:
     ) -> Any:
         encoded_body = None if body is None else json.dumps(body).encode("utf-8")
         request = Request(url=url, method=method, headers=headers, data=encoded_body)
-        error: Exception | None = None
-
         for attempt in range(1, self.retry_policy.attempts + 1):
             try:
                 with urlopen(request, timeout=timeout) as response:
                     payload = response.read().decode("utf-8")
                     return json.loads(payload) if payload else {}
             except HTTPError as exc:
-                error = exc
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self.retry_policy.attempts:
                     time.sleep(self.retry_policy.backoff_seconds * attempt)
                     continue
                 raise
             except URLError as exc:
-                error = exc
                 if attempt < self.retry_policy.attempts:
                     time.sleep(self.retry_policy.backoff_seconds * attempt)
                     continue
                 raise
-
-        raise RuntimeError(f"Request failed after retries: {error}")
 
 
 class GitHubClient:
@@ -84,12 +78,12 @@ class GitHubClient:
         self.http = http_client or HttpClient()
 
     def get_issue(self, repo: str, number: int) -> dict[str, Any]:
-        auth_header = "Bearer " + self.token
+        authorization_header = "Bearer " + self.token
         return self.http.request(
             "GET",
             f"https://api.github.com/repos/{repo}/issues/{number}",
             headers={
-                "Authorization": auth_header,
+                "Authorization": authorization_header,
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "sentinel-agent",
             },
@@ -122,12 +116,12 @@ class SlackClient:
         self.http = http_client or HttpClient()
 
     def post_message(self, channel: str, text: str) -> dict[str, Any]:
-        auth_header = "Bearer " + self.token
+        authorization_header = "Bearer " + self.token
         return self.http.request(
             "POST",
             "https://slack.com/api/chat.postMessage",
             headers={
-                "Authorization": auth_header,
+                "Authorization": authorization_header,
                 "Content-Type": "application/json; charset=utf-8",
             },
             body={"channel": channel, "text": text},
@@ -153,10 +147,10 @@ class _NoopSpan:
         return False
 
     def set_attribute(self, key: str, value: Any) -> None:
-        return None
+        pass
 
     def record_exception(self, exc: Exception) -> None:
-        return None
+        pass
 
 
 class _NoopTracer:
@@ -228,7 +222,8 @@ class MultiTurnAgent:
     def _render_slack_payload(self, message: str, outputs: dict[str, Any], failures: list[str]) -> str:
         if failures:
             return f"Sentinel degraded response for: {message}. Failures: {', '.join(failures)}"
-        github_title = outputs.get("github", {}).get("title", "unknown") if isinstance(outputs.get("github"), dict) else "unknown"
+        github_output = outputs.get("github")
+        github_title = github_output.get("title", "unknown") if isinstance(github_output, dict) else "unknown"
         return f"Sentinel summary for '{message}' (GitHub issue: {github_title})"
 
     def _invoke_tool(self, span_name: str, func: Callable[[], Any], failures: list[str]) -> Any:
@@ -237,28 +232,33 @@ class MultiTurnAgent:
                 return func()
             except Exception as exc:  # noqa: BLE001 - graceful degradation path
                 failures.append(span_name)
-                with self._span("tool.failure", {"tool.name": span_name, "tool.error": str(exc)}):
+                traceback_text = traceback.format_exc()
+                with self._span(
+                    "tool.failure",
+                    {"tool.name": span_name, "tool.error": str(exc), "tool.traceback": traceback_text},
+                ):
                     pass
                 return {
                     "status": "degraded",
                     "tool": span_name,
                     "error": str(exc),
+                    "traceback": traceback_text,
                 }
 
     def _span(self, name: str, attrs: dict[str, Any] | None = None):
-        span_cm = self.tracer.start_as_current_span(name) if self.tracer else nullcontext(_NoopSpan())
+        span_cm = self.tracer.start_as_current_span(name)
 
         class _SpanContext:
-            def __enter__(inner_self):
-                inner_self.span = span_cm.__enter__()
-                if attrs and hasattr(inner_self.span, "set_attribute"):
+            def __enter__(self):
+                self.span = span_cm.__enter__()
+                if attrs and hasattr(self.span, "set_attribute"):
                     for key, value in attrs.items():
-                        inner_self.span.set_attribute(key, value)
-                return inner_self.span
+                        self.span.set_attribute(key, value)
+                return self.span
 
-            def __exit__(inner_self, exc_type, exc, tb):
-                if exc and hasattr(inner_self.span, "record_exception"):
-                    inner_self.span.record_exception(exc)
+            def __exit__(self, exc_type, exc, tb):
+                if exc and hasattr(self.span, "record_exception"):
+                    self.span.record_exception(exc)
                 return span_cm.__exit__(exc_type, exc, tb)
 
         return _SpanContext()
